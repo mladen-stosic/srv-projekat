@@ -1,0 +1,402 @@
+/**
+ * @file    main.c
+ * @author  Mladen Stosic
+ * @date    May 2022
+ * @brief   SRV Project 14
+ *
+ * Reading of ADC channels 0 and 1
+ * and displaying average of the last 16
+ * measured values on 7seg display when
+ * '2' or '3' ASCII characters are received
+ * over UART
+ */
+
+/* Standard includes. */
+#include <stdio.h>
+#include <stdlib.h>
+
+/* FreeRTOS includes. */
+#include "FreeRTOS.h"
+#include "task.h"
+#include "queue.h"
+#include "event_groups.h"
+
+/* Hardware includes. */
+#include "msp430.h"
+
+/* User's includes */
+#include "ETF5529_HAL/hal_ETF_5529.h"
+
+// Baud rate value from lookup table
+#define BAUD9600                ( 1041 )
+
+// Define timer task delay
+#define mainTIMER_TASK_DELAY    ( 1000 )
+
+// Define Queue lengths
+#define mainADC_QUEUE_LENGTH        2
+#define mainDISPLAY_QUEUE_LENGTH    2
+
+// Define event group bits
+#define  mainEVENT_BIT_UART_2       0x02    // xTask2 blocking event bit mask, unblocked from UART ISR
+#define  mainEVENT_BIT_UART_3       0x04    // xTask3 blocking event bit mask, unblocked from UART ISR
+
+// Define task priorities
+#define main_TASK1_PRIO         ( 2 )
+#define main_TASK2_PRIO         ( 2 )
+#define main_TASK3_PRIO         ( 2 )
+#define main_7SEGTASK_PRIO      ( 1 )
+#define main_TIMER_TASK_PRIO    ( 1 )
+
+// Define structure Package
+typedef struct Package{
+    uint8_t channel; // ADC Channel
+    uint16_t value;  // Value read from the channel
+} package;
+
+// Task Handles
+TaskHandle_t        xTask2Handle;
+TaskHandle_t        xTask3Handle;
+
+// Event Group Handles
+EventGroupHandle_t  xControlGroup;
+
+// Queue Handles
+xQueueHandle    xADCQueue;
+xQueueHandle    xDisplayQueue;
+
+// Initialize arrays holding values from ADC 0 & 1
+uint16_t    adc0[16] = {0};
+uint16_t    adc1[16] = {0};
+
+// Initialize average value variables
+// Scaled down to higher 8 bits for displaying on 7seg
+uint8_t     adc0avg;
+uint8_t     adc1avg;
+
+// Initialize counters for ADC conversion
+uint8_t     i=0;        // Channel 0 counter
+uint8_t     j=0;        // Channel 1 counter
+uint8_t     channel;    // Channel selection variable
+
+static void prvSetupHardware( void );
+
+/**
+ * @brief Timer Task
+ *
+ * Triggers ADC conversion every second
+ */
+static void xTaskTimer( void *pvParameters )
+{
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    for ( ;; )
+    {
+        // Delay task for 1s
+        vTaskDelayUntil( &xLastWakeTime, mainTIMER_TASK_DELAY );
+        ADC12CTL0 |= ADC12SC;   // Start ADC Conversion
+    }
+}
+/**
+ * @brief 7seg display task function
+ *
+ * Displays average value of one of the ADC ports
+ * on 7seg display
+ */
+static void xTaskLED( void *pvParameters )
+{
+    // Init local variables
+    static uint8_t prvDigit;
+    static uint8_t prvFirstDigit = 0;
+    static uint8_t prvSecondDigit = 0;
+    for ( ;; )
+    {
+        // If there's a new info in queue
+        if (xQueueReceive(xDisplayQueue, &prvDigit, 0) == pdTRUE)
+        {
+            // Update values
+            // Values range from 00 to FF
+            // Extract first digit
+            prvFirstDigit = (prvDigit >> 4) & 0x0f;
+            // Extract second digit
+            prvSecondDigit = prvDigit & 0x0f;
+        }
+        // Display values
+        HAL_7SEG_DISPLAY_1_ON;
+        HAL_7SEG_DISPLAY_2_OFF;
+        vHAL7SEGWriteDigit(prvSecondDigit);
+        vTaskDelay(pdMS_TO_TICKS(5));
+        HAL_7SEG_DISPLAY_2_ON;
+        HAL_7SEG_DISPLAY_1_OFF;
+        vHAL7SEGWriteDigit(prvFirstDigit);
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+/**
+ * @brief Task 1 function
+ *
+ * Takes values from queue, fills ADC value arrays and
+ * calculates its average value
+ * Sends average result Task2 or Task3
+ */
+static void xTask1( void *pvParameters )
+{
+    // Initialize local variables
+    uint32_t    prvSum;         // Sum variable used in average calculation
+    uint8_t     prvCnt;         // Counter
+    package     prvPackage;     // Received package
+    for ( ;; )
+    {
+        // Take values from Queue
+        xQueueReceive(xADCQueue, &prvPackage, portMAX_DELAY);
+        // Extract channel number from package
+        channel = prvPackage.channel;
+        if (channel == 0)
+        {
+            // Extract value from package and increment ch0 counter
+            adc0[i++] = prvPackage.value;
+            // Reset counter when max value is reached
+            if (i > 15)
+            {
+                i = 0;
+            }
+            // Calculate average value
+            prvSum = 0;
+            for (prvCnt = 0; prvCnt < 16; prvCnt++)
+            {
+                prvSum += adc0[prvCnt];
+            }
+            // Calculate average and take only higher 8 bits
+            adc0avg = (prvSum >> 8) & 0xff;    // (sum / 16) >> 4
+                                               // 8 higher bits of average value
+            // Mailbox send to Task2
+            xTaskNotify(xTask2Handle, adc0avg, eSetValueWithOverwrite);
+        }
+        else if (channel == 1)
+        {
+            // Extract value from package and increment ch1 counter
+            adc1[j++] = prvPackage.value;
+            // Reset counter when max value is reached
+            if (j > 15)
+            {
+                j = 0;
+            }
+            // Calculate average value
+            prvSum = 0;
+            for (prvCnt = 0; prvCnt < 16; prvCnt++)
+            {
+                prvSum += adc1[prvCnt];
+            }
+            // Calculate average and take only higher 8 bits
+            adc1avg = (prvSum >> 8) & 0xff;    // (sum / 16) >> 4
+                                               // 8 higher bits of average value
+            // Mailbox send to Task3
+            xTaskNotify(xTask3Handle, adc1avg, eSetValueWithOverwrite);
+        }
+        else    // Catch any exceptions
+        {
+            break;
+        }
+    }
+}
+
+/**
+ * @brief Task 2 function
+ *
+ *  When ASCII character '2' is received over UART
+ *  take value from mailbox and send it to xTaskLED
+ *  using Display Queue
+ */
+static void xTask2( void *pvParameters )
+{
+    uint8_t prvAverage;
+    for ( ;; )
+    {
+        // Blocked until '2' is received over UART
+        xEventGroupWaitBits(xControlGroup,
+                            mainEVENT_BIT_UART_2,
+                            pdTRUE,
+                            pdFALSE,
+                            portMAX_DELAY);
+
+        // Take info from mailbox
+        prvAverage = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        // Send to display Task
+        xQueueSend(xDisplayQueue, &prvAverage, portMAX_DELAY);
+    }
+}
+
+/**
+ * @brief Task 3 function
+ *
+ *  When ASCII character '3' is received over UART
+ *  take value from mailbox and send it to xTaskLED
+ *  using Display Queue
+ */
+static void xTask3( void *pvParameters )
+{
+    uint8_t prvAverage;
+    for ( ;; )
+    {
+        // Blocked until '3' is received over UART
+        xEventGroupWaitBits(xControlGroup,
+                            mainEVENT_BIT_UART_3,
+                            pdTRUE,
+                            pdFALSE,
+                            portMAX_DELAY);
+        // Take info from mailbox
+        prvAverage = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        // Send to display Task
+        xQueueSend(xDisplayQueue, &prvAverage, portMAX_DELAY);
+    }
+}
+
+/**
+ * @brief main function
+ */
+void main( void )
+{
+    /* Configure peripherals */
+    prvSetupHardware();
+
+    /* Create tasks */
+    xTaskCreate( xTaskLED,                      // task function
+                 "7Seg Task",                   // task name
+                 configMINIMAL_STACK_SIZE,      // stack size
+                 NULL,                          // no parameter is passed
+                 main_7SEGTASK_PRIO,            // priority
+                 NULL                           // we don't need handle
+               );
+    xTaskCreate( xTaskTimer,                    // task function
+                 "Timer Task",                  // task name
+                 configMINIMAL_STACK_SIZE,      // stack size
+                 NULL,                          // no parameter is passed
+                 main_TIMER_TASK_PRIO,          // priority
+                 NULL                           // we don't need handle
+               );
+    xTaskCreate( xTask1,                        // task function
+                 "Task 1",                      // task name
+                 configMINIMAL_STACK_SIZE,      // stack size
+                 NULL,                          // no parameter is passed
+                 main_TASK1_PRIO,               // priority
+                 NULL                           // we don't need handle
+               );
+    xTaskCreate( xTask2,                        // task function
+                 "Task 2",                      // task name
+                 configMINIMAL_STACK_SIZE,      // stack size
+                 NULL,                          // no parameter is passed
+                 main_TASK2_PRIO,               // priority
+                 &xTask2Handle                  // we need handle for notification
+               );
+    xTaskCreate( xTask3,                        // task function
+                 "Task 3",                      // task name
+                 configMINIMAL_STACK_SIZE,      // stack size
+                 NULL,                          // no parameter is passed
+                 main_TASK3_PRIO,               // priority
+                 &xTask3Handle                  // we need handle for notification
+               );
+
+    // Create queues
+    xADCQueue           =   xQueueCreate(mainADC_QUEUE_LENGTH, sizeof(package));
+    xDisplayQueue       =   xQueueCreate(mainDISPLAY_QUEUE_LENGTH, sizeof(uint8_t));
+    // Create event group
+    xControlGroup       =   xEventGroupCreate();
+
+    /* Start the scheduler. */
+    vTaskStartScheduler();
+
+    /* If all is well then this line will never be reached.  If it is reached
+    then it is likely that there was insufficient (FreeRTOS) heap memory space
+    to create the idle task.  This may have been trapped by the malloc() failed
+    hook function, if one is configured. */	
+    for( ;; );
+}
+
+/**
+ * @brief Configure hardware upon boot
+ */
+static void prvSetupHardware( void )
+{
+    taskDISABLE_INTERRUPTS();
+
+    /* Disable the watchdog. */
+    WDTCTL = WDTPW + WDTHOLD;
+
+    // Enable system clock
+    hal430SetSystemClock( configCPU_CLOCK_HZ, configLFXT_CLOCK_HZ );
+
+    // Initialize LEDs
+    vHALInitLED();
+    // Initialize 7seg display
+    vHAL7SEGInit();
+    // Initialize ADC
+    P6SEL       |= BIT0 + BIT1;                 // P6.0 and P6.1 ADC option select
+    ADC12CTL0   &= ~ADC12ENC;                   // Disable ADC during setup
+    ADC12CTL0   = ADC12SHT02 + ADC12ON + ADC12MSC; // Sampling time, ADC12 on, multiple sample conversion
+    ADC12CTL1   = ADC12SHP + ADC12CONSEQ_1;     // Use sampling timer, Sequence of channels mode
+    ADC12IE     = ADC12IE0 + ADC12IE1;          // Enable interrupts on channels 0 & 1
+    ADC12MCTL0  |= ADC12INCH_0;                 // Input channel 0 (A0 P6.0)
+    ADC12MCTL1  |= ADC12INCH_1 + ADC12EOS;      // Input channel 1 (A1 P6.1) + End of sequence
+    ADC12CTL0   |= ADC12ENC;                    // Enable ADC after setup
+    // Initialize UART
+    P4SEL       |= BIT4+BIT5;       // P4.4,5 = USCI_AA TXD/RXD
+    UCA1CTL1    |= UCSWRST;         // **Put state machine in reset**
+    UCA1CTL1    |= UCSSEL_2;        // SMCLK
+    UCA1BRW      = BAUD9600;        // 1MHz - Baudrate 9600
+    UCA1MCTL    |= UCBRS_6 + UCBRF_0;// Modulation UCBRSx=1, UCBRFx=0
+    UCA1CTL1    &= ~UCSWRST;        // **Initialize USCI state machine**
+    UCA1IE      |= UCRXIE;          // Enable USCI_A1 RX interrupt
+
+    // Enable global interrupts
+    taskENABLE_INTERRUPTS();
+
+}
+// ADC Interrupt routine
+void __attribute__ ( ( interrupt( ADC12_VECTOR  ) ) ) vADC12ISR( void )
+{
+    package prvPackage;
+    switch(__even_in_range(ADC12IV,34))
+    {
+        case  6:                // Vector  6:  ADC12IFG0
+            // Fill package
+            prvPackage.channel  = 0;
+            prvPackage.value = ADC12MEM0;
+            // Sending ADC Port number (0 or 1) and value converted from the port
+            xQueueSendFromISR(xADCQueue, &prvPackage, 0);
+            break;
+        case  8:                // Vector  8:  ADC12IFG1
+            // Fill package
+            prvPackage.channel  = 1;
+            prvPackage.value = ADC12MEM1;
+            // Sending ADC Port number (0 or 1) and value converted from the port
+            xQueueSendFromISR(xADCQueue, &prvPackage, 0);
+            break;
+        default:
+            break;
+    }
+}
+// UART Interrupt routine
+void __attribute__ (( interrupt (USCI_A1_VECTOR))) vUARTISR ( void )
+{
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+    uint8_t     received;   // UART received message
+    // Store received UART data
+    received = UCA1RXBUF;
+    // Enable Task2 to write to display
+    if (received == '2')
+    {
+        xEventGroupSetBitsFromISR(xControlGroup, mainEVENT_BIT_UART_2, &xHigherPriorityTaskWoken);
+    }
+    // Enable Task3 to write to display
+    else if (received == '3')
+    {
+        xEventGroupSetBitsFromISR(xControlGroup, mainEVENT_BIT_UART_3, &xHigherPriorityTaskWoken);
+    }
+    // Catch and discard any other received values
+    else{};
+
+    /* trigger scheduler if higher priority task is woken */
+    portYIELD_FROM_ISR( xHigherPriorityTaskWoken );
+
+}
