@@ -5,7 +5,6 @@ Written in C, utilizing FreeRTOS
 
 ### Project task:
 Start acquisition from A0 and A1 ADC channels every 1000ms using xTaskTimer task that uses vTaskDelayUntil function. 
-
 Implement ADC delayed interrupt proccessing, so that xTask1 waits for Queue that's filled from ISR.
 Queue message should contain number of read channel and 12-bit read from ADC.
 xTask1 should calculate average value of last 16 read values from each channel seperately, and send it to xTask2 and xTask3 by Direct-to-task notification used in mailbox mode.
